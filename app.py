@@ -6,6 +6,7 @@ from tracking import *
 from get_roi import *
 from welch_update import *
 from respiratory_rate import *
+from filter_variance import *
 
 
 class SampleError(RuntimeError):
@@ -34,10 +35,14 @@ class App():
 
 
         self.HeartRate = 0
+        self.HeartRateValid = False
         self.RespRate = 0
         self.n = 0
         self.raw_signal = []
         self.filtered_signal = []
+        self.brightness = ([], [], [])
+        self.distance_ratio = ([], [], [])
+        self.snr = [0]
         
         self.bandPass = signal.firwin(200, np.array([min_bpm, max_bpm])/60, fs=Fs, pass_zero=False)
         self.z = 4*np.ones(self.bandPass.shape[-1]-1)
@@ -46,6 +51,7 @@ class App():
         self.roi_finder = roi(types=['all'])
         self.resp = respiratory(n_beats=40, distance=int(Fs/2), nwindows=6)
         self.welch_obj = welch_update(fs=Fs, nperseg=self.nperseg, nwindows=20, nfft=Fs*60)
+        self.heart_rate_otlier_removal = VarianceFilter()
 
            
         
@@ -54,9 +60,20 @@ class App():
             self.bbox = self.tracker.update(frame)
         
         except (TrackingError, OutOfFrameError, DetectionError) as err:
+            print(err.message)
             raise SampleError
+        
+        except JumpingError:
+            print("either you're moving too fast or another face entered the view of the camera,")
+            print("the app supports only one person at a time")
+            raise SampleError
+        except Exception as err:
+            print('unknown error in tracking')
+            print(err)
            
         self.get_signal(frame)
+        self.get_brightness(frame)
+        self.get_distance_indicator(frame)
         self.n += 1
         
         if self.bandPass.shape[0] <= self.n and 0 == self.n % 10:
@@ -69,7 +86,8 @@ class App():
         if max(self.nperseg, self.bandPass.shape[0]) <= self.n and 0 == self.n % self.nstep:
             f, pxx = self.welch_obj.update(self.filtered_signal[-self.nperseg:])
             self.WelchQueue.put((f, pxx))
-            self.HeartRate = f[np.argmax(pxx)] * 60
+            self.HeartRate, self.HeartRateValid = self.heart_rate_otlier_removal.update(f[np.argmax(pxx)] * 60)
+            self.get_snr(pxx, f, self.HeartRate/60)
             # print(HeartRate)
             # print(f.shape, f[np.argmax(pxx)])
 
@@ -80,7 +98,10 @@ class App():
             try:
                 freqs, pgram = self.resp.main(self.filtered_signal[-self.resp_nstep:])
                 pgram = pgram * scipy.stats.norm(14/60, 4/60).pdf(freqs*self.Fs)
-                self.RespQueue.put({'freqs': freqs*self.Fs, 'pgram': pgram, 'peak_times': np.array(self.resp.peak_times), 'rri': np.array(self.resp.rri)})
+                self.RespQueue.put({'freqs': freqs*self.Fs, 
+                                    'pgram': pgram, 
+                                    'peak_times': np.array(self.resp.peak_times), 
+                                    'rri': np.array(self.resp.rri)})
                 self.RespRate = freqs[pgram.argmax()] * self.Fs * 60
             except RuntimeError:
                 print('no peaks were found')
@@ -106,12 +127,64 @@ class App():
             
             self.rois.append((x_roi, y_roi, w_roi, h_roi))
             
-            # spatial mean of the bounding box of the face
-            newSample += np.mean(frame[y_roi:y_roi+h_roi+1, x_roi:x_roi+w_roi+1, 1][:]) #\
-                        # - np.mean(frame[y_roi:y_roi+h_roi+1, x_roi:x_roi+w_roi+1, 2][:])
+            try:
+                # spatial mean of the bounding box of the face
+                newSample += np.mean(frame[y_roi:y_roi+h_roi+1, x_roi:x_roi+w_roi+1, 1][:]) #\
+                            # - np.mean(frame[y_roi:y_roi+h_roi+1, x_roi:x_roi+w_roi+1, 2][:])
+                            
+            except Exception as err:
+                print(err)
+                
                         
         self.raw_signal.append(newSample)
 
+
+
+    def get_brightness(self, frame):
+        """
+        This function computes the brightness in the rois, for quality assurance purposes
+        """
+        gray = cv2.cvtColor(frame, cv2. COLOR_BGR2GRAY)
+        for (x_roi, y_roi, w_roi, h_roi), brightness in zip(self.rois, self.brightness):
+            
+            try:
+                # spatial mean of the bounding box of the face
+                brightness.append(np.mean(gray[y_roi:y_roi+h_roi+1, x_roi:x_roi+w_roi+1][:]))
+                
+            except RuntimeWarning:
+                brightness.append(0)
+                
+            except Exception as err:
+                print(err)
+
+        return self.brightness
+                        
+
+    def get_distance_indicator(self, frame):
+        """
+        This function computes the area ratio between the rois and the frame, for quality assurance purposes
+        """
+        frame_area = frame.shape[0] * frame.shape[1]
+        for (_, _, w_roi, h_roi), ratio in zip(self.rois, self.distance_ratio):
+            roi_area = w_roi * h_roi
+            ratio.append(roi_area / (frame_area * (100) + 1e-7))
+
+        return self.distance_ratio
+    
+    
+    def get_snr(self, pxx, f, peak):
+        """
+        This function computes the snr of the signal received.txt
+        The snr in this context is defines as the 10*log_10 of the ratio of the Energy of pxx in 
+        the 0.2 Hz around the highest peak and the total energy of the signal
+        """
+        
+        TotalEnergy = pxx.sum()
+        SignalRange = np.logical_and(f > (peak - 0.2), f < (peak + 0.2))
+        SignalEnergy = pxx[SignalRange].sum()
+        snr = 10*np.log10(SignalEnergy / (TotalEnergy - SignalEnergy + 1e-7))
+        self.snr.append(snr)
+        return snr
             
     
     def quit(self):
