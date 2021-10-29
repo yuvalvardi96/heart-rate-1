@@ -34,9 +34,12 @@ class App():
         self.resp_nstep = 10 * Fs  # updating rate of the respiratory rate
 
 
-        self.HeartRate = 0
-        self.HeartRateValid = False
-        self.RespRate = 0
+        self.HeartRate = [0]
+        self.HeartRateValid = [False]
+        self.HeartRateTime = [0]
+        self.RespRate = [0]
+        self.RespRateValid = [False]
+        self.RespRateTime = [0]
         self.n = 0
         self.raw_signal = []
         self.filtered_signal = []
@@ -52,6 +55,7 @@ class App():
         self.resp = respiratory(n_beats=40, distance=int(Fs/2), nwindows=6)
         self.welch_obj = welch_update(fs=Fs, nperseg=self.nperseg, nwindows=20, nfft=Fs*60)
         self.heart_rate_otlier_removal = VarianceFilter()
+        self.resp_rate_otlier_removal = VarianceFilter()
 
            
         
@@ -60,7 +64,7 @@ class App():
             self.bbox = self.tracker.update(frame)
         
         except (TrackingError, OutOfFrameError, DetectionError) as err:
-            print(err.message)
+            # print(err.message)
             raise SampleError
         
         except JumpingError:
@@ -69,7 +73,7 @@ class App():
             raise SampleError
         except Exception as err:
             print('unknown error in tracking')
-            print(err)
+            # print(err)
            
         self.get_signal(frame)
         self.get_brightness(frame)
@@ -85,11 +89,18 @@ class App():
 
         if max(self.nperseg, self.bandPass.shape[0]) <= self.n and 0 == self.n % self.nstep:
             f, pxx = self.welch_obj.update(self.filtered_signal[-self.nperseg:])
-            self.WelchQueue.put((f, pxx))
-            self.HeartRate, self.HeartRateValid = self.heart_rate_otlier_removal.update(f[np.argmax(pxx)] * 60)
-            self.get_snr(pxx, f, self.HeartRate/60)
-            # print(HeartRate)
-            # print(f.shape, f[np.argmax(pxx)])
+            HeartRate, HeartRateValid = self.heart_rate_otlier_removal.update(f[np.argmax(pxx)] * 60)
+            self.get_snr(pxx, f, self.HeartRate[-1]/60)
+            self.HeartRate.append(HeartRate)
+            self.HeartRateValid.append(HeartRateValid)
+            self.HeartRateTime.append(self.n/self.Fs)
+            self.WelchQueue.put({'f': f, 'pxx': pxx, 
+                                 'HeartRate': np.array(self.HeartRate), 
+                                 'HeartRateValid': np.array(self.HeartRateValid), 
+                                 'HeartRateTime': np.array(self.HeartRateTime), 
+                                 'Lower': self.heart_rate_otlier_removal.lower, 
+                                 'Higher': self.heart_rate_otlier_removal.higher})
+
 
         if max(self.resp_nstep, self.bandPass.shape[0]) <= self.n and 0 == self.n % self.resp_nstep:
             if self.resp.time == 0:
@@ -98,11 +109,21 @@ class App():
             try:
                 freqs, pgram = self.resp.main(self.filtered_signal[-self.resp_nstep:])
                 pgram = pgram * scipy.stats.norm(14/60, 4/60).pdf(freqs*self.Fs)
+                RespRate, RespRateValid = self.resp_rate_otlier_removal.update(freqs[pgram.argmax()] * self.Fs * 60)
+                self.RespRate.append(RespRate)
+                self.RespRateValid.append(RespRateValid)
+                self.RespRateTime.append(self.n/self.Fs)
+                
                 self.RespQueue.put({'freqs': freqs*self.Fs, 
                                     'pgram': pgram, 
                                     'peak_times': np.array(self.resp.peak_times), 
-                                    'rri': np.array(self.resp.rri)})
-                self.RespRate = freqs[pgram.argmax()] * self.Fs * 60
+                                    'rri': np.array(self.resp.rri),
+                                    'RespRate': np.array(self.RespRate), 
+                                    'RespRateValid': np.array(self.RespRateValid), 
+                                    'RespRateTime': np.array(self.RespRateTime), 
+                                    'Lower': self.resp_rate_otlier_removal.lower, 
+                                    'Higher': self.resp_rate_otlier_removal.higher})
+                
             except RuntimeError:
                 print('no peaks were found')
 
@@ -167,7 +188,7 @@ class App():
         frame_area = frame.shape[0] * frame.shape[1]
         for (_, _, w_roi, h_roi), ratio in zip(self.rois, self.distance_ratio):
             roi_area = w_roi * h_roi
-            ratio.append(roi_area / (frame_area * (100) + 1e-7))
+            ratio.append(roi_area / (frame_area + 1e-7) * (100))
 
         return self.distance_ratio
     
