@@ -73,9 +73,9 @@ class VideoThread(QThread):
                         self.changeLight.emit(np.mean([level[-1] for level in self.App.brightness]))
                         self.changeDistance.emit(np.mean([level[-1] for level in self.App.distance_ratio]))
                         self.changeHrResp.emit({'hr': self.App.HeartRate[-1], 
-                                                'hrValid': self.App.HeartRateValid, 
+                                                'hrValid': self.App.HeartRateValid[-1], 
                                                 'resp': self.App.RespRate[-1],
-                                                'respValid': self.App.RespRateValid})
+                                                'respValid': self.App.RespRateValid[-1]})
                     
                 except SampleError as err:
                     frameRect =  cv2.flip(frame, 1)
@@ -159,12 +159,19 @@ class AppWindow(QWidget):
             WelchData = self.App.WelchQueue.get_nowait()
             WelchLine.set_data(WelchData['f']*60, WelchData['pxx'])
             
-            hrLine.set_data(WelchData['HeartRate']-WelchData['HeartRate'][-1]+2*self.n_seconds,
+            offset_hr = WelchData['HeartRateTime'][-1] - 2*self.n_seconds if WelchData['HeartRateTime'][-1] > 2*self.n_seconds else 0
+            hrLine.set_data(WelchData['HeartRateTime'] - offset_hr,
                             WelchData['HeartRate'])
-            self.WelchAx.set_ylim([0, max(WelchData['pxx'].max(), 1.1)])
+            self.WelchAx.set_ylim([0, max(np.nanmax(WelchData['pxx']), 1.1)])
             
         except Empty:
             pass
+        
+        except BaseException as e:
+            print(e)
+            
+        except:
+            print('unknown exception at RespUpdate')
          
         
         try:
@@ -182,7 +189,8 @@ class AppWindow(QWidget):
                 newData = self.App.RespQueue.get_nowait()
                 self.newData = newData
                 
-                respLine.set_data(newData['RespRateTime']-newData['RespRateTime'][-1]+2*self.n_seconds,
+                offset_rr = newData['RespRateTime'][-1] - 2*self.n_seconds if newData['RespRateTime'][-1] > 2*self.n_seconds else 0
+                respLine.set_data(newData['RespRateTime'] - offset_rr,
                             newData['RespRate'])
             
             except Empty:
@@ -218,6 +226,23 @@ class AppWindow(QWidget):
                               + '<font color="{hrColor}"> {hr:.0f} [bpm]</font>'
                               + '<br><br><font color="black">&nbsp; Respiratory Rate:</font>'
                               + '<font color="{respColor}"> {resp:.0f} [bpm]</font>').format(**result))
+    
+    
+    def reset_plot(self):
+        del self.newData
+        self.newData = None
+        
+        axes_to_reset = (self.hrAx, 
+                         self.respAx, 
+                         self.ppgAx, 
+                         self.WelchAx, 
+                         self.lombAx)
+        
+        for ax in axes_to_reset:
+            lines = ax.get_lines()
+            
+            for line in lines:
+                line.set_data([], [])
     
     
     def closeEvent(self, event):
@@ -260,12 +285,12 @@ class AppWindow(QWidget):
         self.buttons_grid.addWidget(self.welchSpinBox, 1, 1, 1, 1, alignment=Qt.AlignBottom)
         
         # add spinbox for resp history
-        self.respSpinBox = QLabeledSpinBox(label='welch\nwindow length')
+        self.respSpinBox = QLabeledSpinBox(label='lomb no.\nof windows', initValue=6)
         self.respSpinBox.setGeometry(0, 0, 40, 20)
         self.buttons_grid.addWidget(self.respSpinBox, 1, 2, 1, 1, alignment=Qt.AlignBottom)
         
         # add spinbox for welch window size
-        self.welchWinSizeSpinBox = QLabeledSpinBox(label='lomb no.\nof windows')
+        self.welchWinSizeSpinBox = QLabeledSpinBox(label='welch\nwindow length')
         self.welchWinSizeSpinBox.setGeometry(0, 0, 40, 20)
         self.buttons_grid.addWidget(self.welchWinSizeSpinBox, 1, 3, 1, 1, alignment=Qt.AlignBottom)
         
@@ -325,11 +350,19 @@ class AppWindow(QWidget):
         self.lombAx = self.RespFig.add_subplot(gs[2, 1])
         
 
-        self.WelchAx.plot([], [])
-        self.WelchAx.set_xlabel('bpm')
-        self.WelchAx.set_title('heart rate: welch')
+        COLOR_LOMB = 'magenta'
+        COLOR_WELCH = 'blue'
+        self.WelchAx.plot([], [], color=COLOR_WELCH)
+        self.WelchAx.set_xlabel('beats per minute')
+        self.WelchAx.set_title('heart rate: welch', color=COLOR_WELCH)
         self.WelchAx.set_xlim([0, 180])
         self.WelchAx.set_ylim([0, 1.1])
+        
+        self.lombAx.plot([], [], color=COLOR_LOMB)
+        self.lombAx.set_xlim([0, 40])
+        self.lombAx.set_ylim([0, 1.1])
+        self.lombAx.set_xlabel('breaths per minute')
+        self.lombAx.set_title('resp. rate: lomb', color=COLOR_LOMB)
         
         
         # self.ppgAx, self.rriAx, self.lombAx = self.RespFig.subplots(nrows=3, ncols=2)
@@ -339,27 +372,26 @@ class AppWindow(QWidget):
         self.ppgAx.set_xlabel('time')
         self.ppgAx.set_title('ppg signal')
 
-        self.hrAx.step([], [], color='green')
+        self.hrAx.step([], [], color=COLOR_WELCH)
         self.hrAx.set_xlim([0, 2*self.n_seconds])
         self.hrAx.set_ylim([45, 100])
         self.hrAx.set_xlabel('time')
-        self.hrAx.set_ylabel('hr [bpm]', color='red')
+        self.hrAx.set_ylabel('hr [bpm]', color=COLOR_WELCH)
         self.hrAx.set_title('heart-rate and respiratory-rate')
         
-        self.respAx.step([], [], color='blue')
+        self.respAx.step([], [], color=COLOR_LOMB)
         self.respAx.set_ylim([5, 25])
-        self.respAx.set_ylabel('resp. rate [bpm]', color='purple')
+        self.respAx.set_ylabel('resp. rate [bpm]', color=COLOR_LOMB)
         
-        self.lombAx.plot([], [])
-        self.lombAx.set_xlim([0, 40])
-        self.lombAx.set_ylim([0, 1.1])
-        self.lombAx.set_xlabel('breaths per minute')
-        self.lombAx.set_title('lomb periogogram')
         
         # self.WelchFig.tight_layout()
         self.RespFig.tight_layout()
         
         self.App = App(Fs=self.Fs)
+        self.welchSpinBox.connect(self.App.set_welch_nwindows)
+        self.respSpinBox.connect(self.App.set_lomb_nwindows)
+        self.resetButton.clicked.connect(self.App.reset)
+        self.resetButton.clicked.connect(self.reset_plot)
         
         # self.Welchani = FuncAnimation(self.RespFig, self.WelchUpdate, blit=True, interval=100) 
         self.RespAni = FuncAnimation(self.RespFig, self.RespUpdate, blit=True, interval=100)
